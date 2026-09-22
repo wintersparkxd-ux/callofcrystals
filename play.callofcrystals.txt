@@ -1,0 +1,748 @@
+package com.yourmod.battleroyale;
+
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.entity.EntityType;
+import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.World;
+import net.minecraft.world.border.WorldBorder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class BattleRoyaleMod implements ModInitializer {
+    public static final Logger LOGGER = LoggerFactory.getLogger("battleroyale");
+    
+    // Game state
+    private static GameState gameState = GameState.IDLE;
+    private static final Map<UUID, PlayerData> playerData = new ConcurrentHashMap<>();
+    private static final Map<UUID, Team> teams = new ConcurrentHashMap<>();
+    private static final List<UUID> matchPlayers = new ArrayList<>();
+    private static final Map<UUID, PlayerInvite> pendingInvites = new HashMap<>();
+    
+    // Match configuration
+    private static int matchTimer = 0;
+    private static int borderShrinkTimer = 0;
+    private static boolean soloMode = true;
+    private static final int MATCH_DURATION = 300; // 5 minutes
+    private static final int INVITE_TIMEOUT = 120; // 2 minutes in seconds
+    private static final int MAX_TEAM_SIZE = 3;
+    
+    // ELO system
+    private static final Map<UUID, Integer> eloRatings = new ConcurrentHashMap<>();
+    
+    // Border configuration
+    private static int configuredBorderSize = 1000;
+    private static int originalBorderSize = 1000;
+    private static int targetBorderSize = 100;
+    
+    // Victory screen timer
+    private static int victoryScreenTimer = 0;
+    
+    @Override
+    public void onInitialize() {
+        LOGGER.info("Battle Royale Mod initialized!");
+        
+        // Register commands
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            BattleRoyaleCommands.register(dispatcher);
+        });
+        
+        // Register tick handler
+        ServerTickEvents.END_SERVER_TICK.register(this::tick);
+        
+        // Register item use handler
+        UseItemCallback.EVENT.register((player, world, hand) -> {
+            if (player instanceof ServerPlayerEntity serverPlayer && gameState == GameState.ACTIVE) {
+                ItemStack stack = player.getStackInHand(hand);
+                handleSpecialItems(serverPlayer, world, stack);
+            }
+            return ActionResult.PASS;
+        });
+    }
+    
+    private void tick(MinecraftServer server) {
+        if (gameState == GameState.ACTIVE) {
+            handleActivePhase(server);
+        } else if (gameState == GameState.VICTORY) {
+            handleVictoryPhase(server);
+        }
+        
+        // Handle pending invites
+        checkPendingInvites();
+    }
+    
+    private static void handleActivePhase(MinecraftServer server) {
+        matchTimer--;
+        
+        if (matchTimer <= 0) {
+            endMatch(server, null);
+            return;
+        }
+        
+        // Shrink border every 30 seconds
+        borderShrinkTimer--;
+        if (borderShrinkTimer <= 0) {
+            shrinkBorder(server);
+            borderShrinkTimer = 30;
+        }
+        
+        // Check win condition
+        checkWinCondition(server);
+        
+        // Send timer updates every 30 seconds and last 10 seconds
+        if (matchTimer % 30 == 0 || matchTimer <= 10) {
+            sendMatchTimer(server);
+        }
+    }
+    
+    private static void handleVictoryPhase(MinecraftServer server) {
+        victoryScreenTimer--;
+        if (victoryScreenTimer <= 0) {
+            resetMatch(server);
+        }
+    }
+    
+    private static void handleSpecialItems(ServerPlayerEntity player, World world, ItemStack stack) {
+        if (stack.getItem() == Items.FEATHER) {
+            launchPlayerForward(player);
+        } else if (stack.getItem() == Items.SNOWBALL) {
+            launchPlayersUpward(player, world);
+        } else if (stack.getItem() == Items.NETHER_STAR) {
+            activateAntiPearl(player);
+        } else if (stack.getItem() == Items.SUGAR) {
+            giveSpeedBoost(player);
+        } else if (stack.getItem() == Items.SLIME_BALL) {
+            throwGravityGrenade(player);
+        } else if (stack.getItem() == Items.NETHERITE_INGOT) {
+            upgradeArmor(player);
+        }
+    }
+    
+    public static void startMatch(MinecraftServer server) {
+        if (matchPlayers.size() < 2) {
+            return;
+        }
+        
+        gameState = GameState.ACTIVE;
+        matchTimer = MATCH_DURATION;
+        borderShrinkTimer = 60; // Start shrinking after 1 minute
+        
+        ServerWorld world = server.getOverworld();
+        WorldBorder border = world.getWorldBorder();
+        
+        // Set the border to configured size
+        border.setSize(configuredBorderSize);
+        originalBorderSize = configuredBorderSize;
+        targetBorderSize = Math.max(50, configuredBorderSize / 10);
+        
+        // Initialize player data and teleport players
+        for (UUID uuid : matchPlayers) {
+            ServerPlayerEntity player = server.getPlayerManager().getPlayer(uuid);
+            if (player != null) {
+                PlayerData data = new PlayerData(uuid);
+                data.setAlive(true);
+                
+                // Set team if in team mode
+                if (!soloMode) {
+                    // Check if player has a team
+                    for (Team team : teams.values()) {
+                        if (team.getMembers().contains(uuid)) {
+                            data.setTeamId(team.getId());
+                            break;
+                        }
+                    }
+                }
+                
+                playerData.put(uuid, data);
+                
+                // Teleport to start position
+                teleportToStart(player);
+                giveStartingLoadout(player);
+                mountEnderDragon(player);
+            }
+        }
+        
+        // Start border shrink
+        border.shrinkBy(originalBorderSize - targetBorderSize, 300);
+        
+        broadcastToMatch(server, "Match Started! Survive the Battle Royale!");
+    }
+    
+    private static void teleportToStart(ServerPlayerEntity player) {
+        WorldBorder border = player.getServerWorld().getWorldBorder();
+        double range = border.getSize() / 2 - 50;
+        double x = border.getCenterX() + (Math.random() * 2 - 1) * range;
+        double z = border.getCenterZ() + (Math.random() * 2 - 1) * range;
+        double y = 200; // Spawn high in the air
+        
+        player.teleport(player.getServerWorld(), x, y, z, 0, 0);
+    }
+    
+    private static void giveStartingLoadout(ServerPlayerEntity player) {
+        // Clear inventory
+        player.getInventory().clear();
+        
+        // Iron Armor with enchantments (no helmet)
+        ItemStack chestplate = new ItemStack(Items.IRON_CHESTPLATE);
+        chestplate.addEnchantment(net.minecraft.enchantment.Enchantments.PROTECTION, 4);
+        chestplate.addEnchantment(net.minecraft.enchantment.Enchantments.UNBREAKING, 3);
+        player.getInventory().armor.set(2, chestplate);
+        
+        ItemStack leggings = new ItemStack(Items.IRON_LEGGINGS);
+        leggings.addEnchantment(net.minecraft.enchantment.Enchantments.BLAST_PROTECTION, 4);
+        player.getInventory().armor.set(1, leggings);
+        
+        ItemStack boots = new ItemStack(Items.IRON_BOOTS);
+        boots.addEnchantment(net.minecraft.enchantment.Enchantments.PROTECTION, 4);
+        boots.addEnchantment(net.minecraft.enchantment.Enchantments.UNBREAKING, 3);
+        player.getInventory().armor.set(0, boots);
+        
+        // Weapons and tools
+        ItemStack sword = new ItemStack(Items.DIAMOND_SWORD);
+        sword.addEnchantment(net.minecraft.enchantment.Enchantments.KNOCKBACK, 1);
+        player.getInventory().setStack(0, sword);
+        
+        ItemStack pickaxe = new ItemStack(Items.DIAMOND_PICKAXE);
+        pickaxe.addEnchantment(net.minecraft.enchantment.Enchantments.EFFICIENCY, 5);
+        player.getInventory().setStack(1, pickaxe);
+        
+        // Starting items
+        player.getInventory().setStack(2, new ItemStack(Items.OBSIDIAN, 8));
+        player.getInventory().setStack(3, new ItemStack(Items.END_CRYSTAL, 2));
+        player.getInventory().setStack(4, new ItemStack(Items.RESPAWN_ANCHOR, 2));
+        player.getInventory().setStack(5, new ItemStack(Items.GLOWSTONE, 4));
+        player.getInventory().setStack(6, new ItemStack(Items.GOLDEN_APPLE, 8));
+        
+        // Special BR items
+        ItemStack antiPearl = new ItemStack(Items.NETHER_STAR);
+        antiPearl.setCustomName(Text.literal("Anti-Pearl Stick").formatted(Formatting.LIGHT_PURPLE));
+        player.getInventory().setStack(7, antiPearl);
+        
+        ItemStack speedItem = new ItemStack(Items.SUGAR);
+        speedItem.setCustomName(Text.literal("Speed Boost").formatted(Formatting.YELLOW));
+        player.getInventory().setStack(8, speedItem);
+        
+        ItemStack gravityGrenade = new ItemStack(Items.SLIME_BALL);
+        gravityGrenade.setCustomName(Text.literal("Gravity Grenade").formatted(Formatting.GREEN));
+        player.getInventory().setStack(9, gravityGrenade);
+        
+        ItemStack feather = new ItemStack(Items.FEATHER);
+        feather.setCustomName(Text.literal("Launch Feather").formatted(Formatting.AQUA));
+        player.getInventory().setStack(10, feather);
+        
+        ItemStack snowball = new ItemStack(Items.SNOWBALL, 3);
+        snowball.setCustomName(Text.literal("Launch Snowball").formatted(Formatting.WHITE));
+        player.getInventory().setStack(11, snowball);
+        
+        // Curse of Binding Elytra
+        ItemStack elytra = new ItemStack(Items.ELYTRA);
+        elytra.addEnchantment(net.minecraft.enchantment.Enchantments.BINDING_CURSE, 1);
+        player.getInventory().armor.set(3, elytra);
+    }
+    
+    private static void mountEnderDragon(ServerPlayerEntity player) {
+        ServerWorld world = player.getServerWorld();
+        var dragon = EntityType.ENDER_DRAGON.create(world);
+        if (dragon != null) {
+            dragon.setPos(player.getX(), player.getY() + 2, player.getZ());
+            world.spawnEntity(dragon);
+            player.startRiding(dragon);
+            
+            // Check when player lands and remove elytra
+            player.getServer().execute(() -> {
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(10000); // Check after 10 seconds
+                        player.getServer().execute(() -> {
+                            if (player.isOnGround()) {
+                                removeElytra(player);
+                            } else {
+                                // Check again after 20 more seconds
+                                Thread.sleep(20000);
+                                player.getServer().execute(() -> removeElytra(player));
+                            }
+                        });
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }).start();
+            });
+        }
+    }
+    
+    private static void removeElytra(ServerPlayerEntity player) {
+        ItemStack elytra = player.getInventory().armor.get(3);
+        if (elytra.getItem() == Items.ELYTRA) {
+            player.getInventory().armor.set(3, ItemStack.EMPTY);
+            player.sendMessage(Text.literal("Elytra removed!").formatted(Formatting.GRAY));
+        }
+    }
+    
+    private static void shrinkBorder(MinecraftServer server) {
+        ServerWorld world = server.getOverworld();
+        WorldBorder border = world.getWorldBorder();
+        
+        double currentSize = border.getSize();
+        double newSize = Math.max(currentSize * 0.8, targetBorderSize);
+        border.shrinkBy(currentSize - newSize, 30);
+        
+        broadcastToMatch(server, "Border shrinking!");
+    }
+    
+    private static void checkWinCondition(MinecraftServer server) {
+        if (soloMode) {
+            long aliveCount = playerData.values().stream()
+                .filter(PlayerData::isAlive)
+                .count();
+            
+            if (aliveCount <= 1) {
+                playerData.values().stream()
+                    .filter(PlayerData::isAlive)
+                    .findFirst()
+                    .ifPresent(winner -> endMatch(server, winner));
+            }
+        } else {
+            // Team mode win check
+            Set<UUID> aliveTeams = new HashSet<>();
+            for (PlayerData data : playerData.values()) {
+                if (data.isAlive() && data.getTeamId() != null) {
+                    aliveTeams.add(data.getTeamId());
+                }
+            }
+            
+            if (aliveTeams.size() <= 1) {
+                if (aliveTeams.isEmpty()) {
+                    endMatch(server, null);
+                } else {
+                    UUID winningTeamId = aliveTeams.iterator().next();
+                    Team winningTeam = teams.get(winningTeamId);
+                    if (winningTeam != null) {
+                        PlayerData leaderData = playerData.get(winningTeam.getLeader());
+                        endMatch(server, leaderData);
+                    }
+                }
+            }
+        }
+    }
+    
+    public static void handlePlayerElimination(ServerPlayerEntity player) {
+        PlayerData data = playerData.get(player.getUuid());
+        if (data != null) {
+            data.setAlive(false);
+            
+            if (data.getTeamId() != null) {
+                Team team = teams.get(data.getTeamId());
+                if (team != null) {
+                    team.getMembers().remove(player.getUuid());
+                    if (team.getMembers().isEmpty()) {
+                        // Team eliminated
+                    }
+                }
+            }
+            
+            player.sendMessage(Text.literal("You have been eliminated!").formatted(Formatting.RED));
+        }
+    }
+    
+    private static void sendMatchTimer(MinecraftServer server) {
+        int minutes = matchTimer / 60;
+        int seconds = matchTimer % 60;
+        String timeString = String.format("%d:%02d", minutes, seconds);
+        
+        for (UUID uuid : matchPlayers) {
+            ServerPlayerEntity player = server.getPlayerManager().getPlayer(uuid);
+            if (player != null) {
+                player.sendMessage(Text.literal("⏱ Time remaining: " + timeString)
+                    .formatted(Formatting.GOLD));
+            }
+        }
+    }
+    
+    public static void endMatch(MinecraftServer server, PlayerData winner) {
+        gameState = GameState.VICTORY;
+        victoryScreenTimer = 200; // 10 seconds (20 ticks per second)
+        
+        if (winner != null) {
+            ServerPlayerEntity winnerPlayer = server.getPlayerManager().getPlayer(winner.getUuid());
+            if (winnerPlayer != null) {
+                // Large victory message
+                winnerPlayer.sendMessage(Text.literal("")
+                    .formatted(Formatting.GOLD));
+                winnerPlayer.sendMessage(Text.literal("🏆🏆🏆 VICTORY! 🏆🏆🏆")
+                    .formatted(Formatting.GOLD, Formatting.BOLD, Formatting.UNDERLINE));
+                winnerPlayer.sendMessage(Text.literal("")
+                    .formatted(Formatting.GOLD));
+                
+                // Calculate XP and ELO
+                int xpEarned = calculateXP(winner);
+                int eloGained = calculateELO(winner);
+                
+                winnerPlayer.sendMessage(Text.literal("✦ XP Earned: " + xpEarned)
+                    .formatted(Formatting.GREEN));
+                winnerPlayer.sendMessage(Text.literal("✦ ELO Gained: +" + eloGained)
+                    .formatted(Formatting.AQUA));
+                
+                // Update ELO
+                int currentElo = eloRatings.getOrDefault(winner.getUuid(), 1000);
+                eloRatings.put(winner.getUuid(), currentElo + eloGained);
+            }
+        } else {
+            broadcastToMatch(server, "Match ended in a draw!");
+        }
+        
+        // Show placements
+        showPlacements(server);
+    }
+    
+    private static int calculateXP(PlayerData winner) {
+        int baseXP = 100;
+        int killBonus = winner.getKills() * 25;
+        return baseXP + killBonus;
+    }
+    
+    private static int calculateELO(PlayerData winner) {
+        return 25 + (winner.getKills() * 5);
+    }
+    
+    private static void showPlacements(MinecraftServer server) {
+        List<PlayerData> sortedPlayers = new ArrayList<>(playerData.values());
+        sortedPlayers.sort((a, b) -> Boolean.compare(b.isAlive(), a.isAlive()));
+        
+        broadcastToMatch(server, "--- Match Results ---");
+        for (int i = 0; i < sortedPlayers.size(); i++) {
+            PlayerData data = sortedPlayers.get(i);
+            ServerPlayerEntity player = server.getPlayerManager().getPlayer(data.getUuid());
+            if (player != null) {
+                broadcastToMatch(server, (i + 1) + ". " + player.getName().getString());
+            }
+        }
+    }
+    
+    public static void resetMatch(MinecraftServer server) {
+        // Clear all BR players
+        for (UUID uuid : matchPlayers) {
+            ServerPlayerEntity player = server.getPlayerManager().getPlayer(uuid);
+            if (player != null) {
+                player.getInventory().clear();
+                player.clearStatusEffects();
+                
+                // Teleport to lobby (spawn)
+                player.teleport(server.getOverworld(), 
+                    server.getOverworld().getSpawnPos().getX(), 
+                    server.getOverworld().getSpawnPos().getY(), 
+                    server.getOverworld().getSpawnPos().getZ(), 
+                    0, 0);
+            }
+        }
+        
+        // Reset border
+        ServerWorld world = server.getOverworld();
+        WorldBorder border = world.getWorldBorder();
+        border.setSize(configuredBorderSize);
+        
+        // Reset game state
+        playerData.clear();
+        teams.clear();
+        matchPlayers.clear();
+        pendingInvites.clear();
+        gameState = GameState.IDLE;
+        
+        broadcastToMatch(server, "Match reset complete! You can start a new match.");
+    }
+    
+    // Item mechanics
+    private static void launchPlayerForward(ServerPlayerEntity player) {
+        Vec3d lookVec = player.getRotationVector();
+        Vec3d velocity = lookVec.multiply(2.0);
+        player.setVelocity(velocity.x, 0.5, velocity.z);
+        player.velocityModified = true;
+        
+        player.getInventory().removeItem(Items.FEATHER, 1);
+        player.sendMessage(Text.literal("Whoosh! Launched forward!").formatted(Formatting.AQUA));
+    }
+    
+    private static void launchPlayersUpward(ServerPlayerEntity player, World world) {
+        double radius = 5.0;
+        double launchHeight = 25.0;
+        
+        for (ServerPlayerEntity target : world.getPlayers()) {
+            if (target != player && target.squaredDistanceTo(player) <= radius * radius) {
+                target.setVelocity(target.getVelocity().x, launchHeight * 0.1, target.getVelocity().z);
+                target.velocityModified = true;
+                target.sendMessage(Text.literal("Launched by snowball!").formatted(Formatting.WHITE));
+            }
+        }
+        
+        player.getInventory().removeItem(Items.SNOWBALL, 1);
+    }
+    
+    private static void activateAntiPearl(ServerPlayerEntity player) {
+        // Disable ender pearls for 10 seconds
+        MinecraftServer server = player.getServer();
+        if (server != null) {
+            server.getPlayerManager().getPlayerList().forEach(p -> {
+                for (int i = 0; i < p.getInventory().size(); i++) {
+                    ItemStack stack = p.getInventory().getStack(i);
+                    if (stack.getItem() == Items.ENDER_PEARL) {
+                        ItemStack disabled = new ItemStack(Items.BARRIER);
+                        disabled.setCustomName(Text.literal("Disabled Pearl").formatted(Formatting.RED));
+                        p.getInventory().setStack(i, disabled);
+                    }
+                }
+            });
+            
+            // Schedule re-enable after 10 seconds
+            server.execute(() -> {
+                try {
+                    Thread.sleep(10000);
+                    server.execute(() -> {
+                        server.getPlayerManager().getPlayerList().forEach(p -> {
+                            for (int i = 0; i < p.getInventory().size(); i++) {
+                                ItemStack stack = p.getInventory().getStack(i);
+                                if (stack.getItem() == Items.BARRIER && 
+                                    stack.getName().getString().contains("Disabled Pearl")) {
+                                    p.getInventory().setStack(i, new ItemStack(Items.ENDER_PEARL));
+                                }
+                            }
+                        });
+                        player.sendMessage(Text.literal("Pearls re-enabled!").formatted(Formatting.GREEN));
+                    });
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            });
+        }
+        
+        player.getInventory().removeItem(Items.NETHER_STAR, 1);
+    }
+    
+    private static void giveSpeedBoost(ServerPlayerEntity player) {
+        player.addStatusEffect(new StatusEffectInstance(StatusEffects.SPEED, 200, 3)); // Speed IV for 10 seconds
+        player.sendMessage(Text.literal("Speed Boost activated!").formatted(Formatting.YELLOW));
+        player.getInventory().removeItem(Items.SUGAR, 1);
+    }
+    
+    private static void throwGravityGrenade(ServerPlayerEntity player) {
+        double radius = 8.0;
+        double launchPower = 3.0;
+        
+        for (ServerPlayerEntity target : player.getServerWorld().getPlayers()) {
+            if (target != player && target.squaredDistanceTo(player) <= radius * radius) {
+                Vec3d direction = target.getPos().subtract(player.getPos()).normalize();
+                target.setVelocity(direction.x * launchPower, launchPower, direction.z * launchPower);
+                target.velocityModified = true;
+                target.sendMessage(Text.literal("Gravity Grenade hit!").formatted(Formatting.GREEN));
+            }
+        }
+        
+        player.getInventory().removeItem(Items.SLIME_BALL, 1);
+        player.sendMessage(Text.literal("Gravity Grenade thrown!").formatted(Formatting.GREEN));
+    }
+    
+    private static void upgradeArmor(ServerPlayerEntity player) {
+        for (int i = 0; i < 4; i++) {
+            ItemStack armor = player.getInventory().armor.get(i);
+            if (!armor.isEmpty()) {
+                int currentProt = armor.getEnchantments().getLevel(net.minecraft.enchantment.Enchantments.PROTECTION);
+                if (currentProt < 4) {
+                    armor.addEnchantment(net.minecraft.enchantment.Enchantments.PROTECTION, currentProt + 1);
+                    player.sendMessage(Text.literal("Armor upgraded!").formatted(Formatting.LIGHT_PURPLE));
+                    player.getInventory().removeItem(Items.NETHERITE_INGOT, 1);
+                    return;
+                }
+            }
+        }
+        
+        player.sendMessage(Text.literal("No armor to upgrade!").formatted(Formatting.RED));
+    }
+    
+    private static void checkPendingInvites() {
+        long currentTime = System.currentTimeMillis();
+        pendingInvites.entrySet().removeIf(entry -> {
+            return currentTime - entry.getValue().getTimestamp() > INVITE_TIMEOUT * 1000;
+        });
+    }
+    
+    private static void broadcastToMatch(MinecraftServer server, String message) {
+        for (UUID uuid : matchPlayers) {
+            ServerPlayerEntity player = server.getPlayerManager().getPlayer(uuid);
+            if (player != null) {
+                player.sendMessage(Text.literal(message).formatted(Formatting.GOLD));
+            }
+        }
+    }
+    
+    // Public methods for commands
+    public static void addToMatch(ServerPlayerEntity player) {
+        if (!matchPlayers.contains(player.getUuid())) {
+            matchPlayers.add(player.getUuid());
+        }
+    }
+    
+    public static void removeFromMatch(ServerPlayerEntity player) {
+        matchPlayers.remove(player.getUuid());
+        playerData.remove(player.getUuid());
+    }
+    
+    public static void setSoloMode(boolean solo) {
+        soloMode = solo;
+    }
+    
+    public static boolean isSoloMode() {
+        return soloMode;
+    }
+    
+    public static GameState getGameState() {
+        return gameState;
+    }
+    
+    public static void setGameState(GameState state) {
+        gameState = state;
+    }
+    
+    public static int getMatchPlayersCount() {
+        return matchPlayers.size();
+    }
+    
+    public static void setBorderSize(int size) {
+        configuredBorderSize = size;
+        targetBorderSize = Math.max(50, size / 10);
+    }
+    
+    public static int getElo(UUID uuid) {
+        return eloRatings.getOrDefault(uuid, 1000);
+    }
+    
+    public static String getRank(int elo) {
+        if (elo >= 2000) return "Diamond";
+        if (elo >= 1500) return "Gold";
+        if (elo >= 1000) return "Silver";
+        if (elo >= 500) return "Bronze";
+        return "Iron";
+    }
+    
+    public static void sendInvite(ServerPlayerEntity inviter, ServerPlayerEntity invitee) {
+        pendingInvites.put(invitee.getUuid(), new PlayerInvite(inviter.getUuid(), invitee.getUuid()));
+    }
+    
+    public static boolean acceptInvite(ServerPlayerEntity inviter, ServerPlayerEntity player) {
+        PlayerInvite invite = pendingInvites.get(player.getUuid());
+        if (invite != null && invite.getInviter().equals(inviter.getUuid())) {
+            // Create or join team
+            Team team = teams.get(inviter.getUuid());
+            if (team == null) {
+                team = new Team(inviter.getUuid());
+                teams.put(inviter.getUuid(), team);
+            }
+            
+            if (!team.isFull()) {
+                team.addMember(player.getUuid());
+                PlayerData data = playerData.get(player.getUuid());
+                if (data != null) {
+                    data.setTeamId(team.getId());
+                }
+                pendingInvites.remove(player.getUuid());
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    public static void declineInvite(ServerPlayerEntity inviter, ServerPlayerEntity player) {
+        pendingInvites.remove(player.getUuid());
+    }
+    
+    public static void forceStartMatch() {
+        gameState = GameState.WAITING;
+    }
+    
+    public static void forceStopMatch() {
+        gameState = GameState.IDLE;
+        matchPlayers.clear();
+        playerData.clear();
+        teams.clear();
+    }
+    
+    // Game state enum
+    public enum GameState {
+        IDLE,
+        WAITING,
+        ACTIVE,
+        VICTORY
+    }
+    
+    // Player data class
+    public static class PlayerData {
+        private UUID uuid;
+        private boolean alive;
+        private int kills;
+        private UUID teamId;
+        
+        public PlayerData(UUID uuid) {
+            this.uuid = uuid;
+            this.alive = true;
+            this.kills = 0;
+        }
+        
+        public UUID getUuid() { return uuid; }
+        public boolean isAlive() { return alive; }
+        public void setAlive(boolean alive) { this.alive = alive; }
+        public int getKills() { return kills; }
+        public void addKill() { this.kills++; }
+        public UUID getTeamId() { return teamId; }
+        public void setTeamId(UUID teamId) { this.teamId = teamId; }
+    }
+    
+    // Team class
+    public static class Team {
+        private UUID id;
+        private UUID leader;
+        private List<UUID> members;
+        
+        public Team(UUID leader) {
+            this.id = UUID.randomUUID();
+            this.leader = leader;
+            this.members = new ArrayList<>();
+            this.members.add(leader);
+        }
+        
+        public UUID getId() { return id; }
+        public UUID getLeader() { return leader; }
+        public List<UUID> getMembers() { return members; }
+        public void addMember(UUID member) { members.add(member); }
+        public void removeMember(UUID member) { members.remove(member); }
+        public boolean isFull() { return members.size() >= MAX_TEAM_SIZE; }
+    }
+    
+    // Invite class
+    public static class PlayerInvite {
+        private UUID inviter;
+        private UUID invitee;
+        private long timestamp;
+        
+        public PlayerInvite(UUID inviter, UUID invitee) {
+            this.inviter = inviter;
+            this.invitee = invitee;
+            this.timestamp = System.currentTimeMillis();
+        }
+        
+        public UUID getInviter() { return inviter; }
+        public UUID getInvitee() { return invitee; }
+        public long getTimestamp() { return timestamp; }
+    }
+}
